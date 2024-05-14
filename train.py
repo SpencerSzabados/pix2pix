@@ -24,6 +24,18 @@ from data import create_dataset
 from models import create_model
 from util.visualizer import Visualizer
 
+import os
+import pathlib as path
+import numpy as np
+import torch as th
+from evaluations.fid_score import calculate_fid_given_paths
+import matplotlib.pyplot as plt
+
+import torch.nn.functional as F
+from torchmetrics.image import StructuralSimilarityIndexMeasure as ssim_measure
+
+
+
 if __name__ == '__main__':
     opt = TrainOptions().parse()   # get training options
     dataset = create_dataset(opt)  # create a dataset given opt.dataset_mode and other options
@@ -35,12 +47,19 @@ if __name__ == '__main__':
     visualizer = Visualizer(opt)   # create a visualizer that display/save images and plots
     total_iters = 0                # the total number of training iterations
 
+    # Evaluation metrics 
+    MAE = []
+    MSE = []
+    fids = []
+    SSIM = []
+
     for epoch in range(opt.epoch_count, opt.n_epochs + opt.n_epochs_decay + 1):    # outer loop for different epochs; we save the model by <epoch_count>, <epoch_count>+<save_latest_freq>
         epoch_start_time = time.time()  # timer for entire epoch
         iter_data_time = time.time()    # timer for data loading per iteration
         epoch_iter = 0                  # the number of training iterations in current epoch, reset to 0 every epoch
         visualizer.reset()              # reset the visualizer: make sure it saves the results to HTML at least once every epoch
         model.update_learning_rate()    # update learning rates in the beginning of every epoch.
+        
         for i, data in enumerate(dataset):  # inner loop within one epoch
             iter_start_time = time.time()  # timer for computation per iteration
             if total_iters % opt.print_freq == 0:
@@ -69,9 +88,85 @@ if __name__ == '__main__':
                 model.save_networks(save_suffix)
 
             iter_data_time = time.time()
-        if epoch % opt.save_epoch_freq == 0:              # cache our model every <save_epoch_freq> epochs
+
+        if epoch % opt.save_epoch_freq == 0: # cache our model every <save_epoch_freq> epochs
             print('saving the model at the end of epoch %d, iters %d' % (epoch, total_iters))
             model.save_networks('latest')
             model.save_networks(epoch)
+
+            with th.no_grad():
+                print("Computing FID of model and L1 score")
+                # sample 50,000 images for computeing fid against train set
+                print("\nGenerating fid samples...", flush=True)
+            
+                sampling_dataset = create_dataset(opt)
+                num_batches = 50000//len(sampling_dataset)
+                for _ in range(num_batches):
+                    for i, data in enumerate(sampling_dataset):
+                        model.set_input(data)
+                        model.forward()
+                        sample = model.fake_B.cpu().detach()
+                        sample = sample.permute(0,2,3,1).numpy()
+                        sample = (sample+1)/2. 
+                        for j in range(len(sample)):
+                            plt.imsave('/home/sszabados/checkpoints/pix2pix/lysto64_random_crop/fid_samples/image_{}.png'.format(i*opt.batch_size+j), sample[j]) # When generating multichannel data
+                            # plt.imsave('fid/{}/image_{}.JPEG'.format("fid_samples", i*batch_size+j), samples[j,:,:,0], cmap='gray') # When generating single channel data
+                print("\nfinished generating fid samples.", flush=True)
+
+                print("\ncomputing fid...")
+                dir2ref = "/home/sszabados/datasets/lysto64_random_crop_pix2pix/B/train/"
+                dir2gen = "/home/sszabados/checkpoints/pix2pix/lysto64_random_crop/fid_samples/"
+                fid_value = 0
+                try:
+                    fid_value = calculate_fid_given_paths(
+                        paths = [dir2ref, dir2gen],
+                        batch_size = 128,
+                        device = "cuda:1",
+                        img_size = 64,
+                        dims = 2048,
+                        num_workers = 1,
+                        eqv = 'D4' 
+                    )
+                except ValueError:
+                    fid_value = np.inf
+                fids.append([epoch,fid_value])
+                # Incrementally save fids after each epoch
+                os.makedirs('/home/sszabados/checkpoints/pix2pix/lysto64_random_crop/metrics/', exist_ok=True)
+                np.save('/home/sszabados/checkpoints/pix2pix/lysto64_random_crop/metrics/fid.npy', np.array(fids))
+                print(f"FID: {fid_value}")
+
+                print("Computing MSE, MSA, SSIM, loss...")
+                val_opt = opt
+                val_opt.phase = "val"
+                sampling_dataset = create_dataset(opt)
+
+                ref_samples = []
+                samples = []
+                for i, data in enumerate(sampling_dataset):
+                    model.set_input(data)
+                    model.forward()
+                    sample = model.fake_B.cpu().detach()
+                    samples.append(sample)
+                    ref_samples.append(model.real_B.cpu().detach())
+                samples = th.cat(samples, dim=0)
+                ref_samples = th.cat(ref_samples, dim=0)
+
+                mse =  F.mse_loss(ref_samples, samples).item()
+                mae = F.l1_loss(ref_samples, samples).item()
+                ssim_T = ssim_measure(data_range=(-1,1))
+                ssim_score = ssim_T(preds=samples, target=ref_samples).item()
+                        
+                MSE.append([epoch, mse])
+                MAE.append([epoch, mae])
+                SSIM.append([epoch, ssim_score])
+                os.makedirs('/home/sszabados/checkpoints/pix2pix/lysto64_random_crop/metrics/', exist_ok=True)
+                np.save('/home/sszabados/checkpoints/pix2pix/lysto64_random_crop/metrics/mse.npy', np.array(MSE))
+                os.makedirs('/home/sszabados/checkpoints/pix2pix/lysto64_random_crop/metrics/', exist_ok=True)
+                np.save('/home/sszabados/checkpoints/pix2pix/lysto64_random_crop/metrics/mae.npy', np.array(MAE))
+                os.makedirs('/home/sszabados/checkpoints/pix2pix/lysto64_random_crop/metrics/', exist_ok=True)
+                np.save('/home/sszabados/checkpoints/pix2pix/lysto64_random_crop/metrics/ssim.npy', np.array(SSIM))
+
+                print(f"MSE: {mse}, MAE: {mae}, SSIM: {ssim_score}")
+
 
         print('End of epoch %d / %d \t Time Taken: %d sec' % (epoch, opt.n_epochs + opt.n_epochs_decay, time.time() - epoch_start_time))
